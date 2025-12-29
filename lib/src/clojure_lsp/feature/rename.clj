@@ -1,9 +1,13 @@
 (ns clojure-lsp.feature.rename
   (:require
+   [clojure-lsp.parser :as parser]
    [clojure-lsp.queries :as q]
+   [clojure-lsp.refactor.edit :as edit]
    [clojure-lsp.settings :as settings]
    [clojure-lsp.shared :as shared]
-   [clojure.string :as string]))
+   [clojure.string :as string]
+   [medley.core :as medley]
+   [rewrite-clj.zip :as z]))
 
 (set! *warn-on-reflection* true)
 
@@ -221,9 +225,181 @@
     :else
     (mapv (partial rename-other replacement db) references)))
 
-(defn ^:private rename-status [db element]
-  (let [references (q/find-references db element true)
-        definition (q/find-definition db element)
+(defn ^:private element-name-range
+  [element]
+  {:name-row (or (:name-row element) (:row element))
+   :name-col (or (:name-col element) (:col element))
+   :name-end-row (or (:name-end-row element) (:end-row element))
+   :name-end-col (or (:name-end-col element) (:end-col element))})
+
+(defn ^:private cursor-token-at-position
+  [db uri row col]
+  (when-let [zloc (some-> (parser/safe-zloc-of-file db uri)
+                          (edit/find-at-pos row col))]
+    (when (identical? :token (z/tag zloc))
+      (let [{:keys [row col end-row end-col] :as node-meta} (meta (z/node zloc))
+            token-str (z/string zloc)
+            token-sexpr (parser/safe-zloc-sexpr zloc)
+            token-name (when (symbol? token-sexpr)
+                         (name token-sexpr))]
+        (when (and row col end-row end-col)
+          {:text token-str
+           :name token-name
+           :range (shared/->range {:row row
+                                   :col col
+                                   :end-row end-row
+                                   :end-col end-col})
+           :pos (select-keys node-meta [:row :col :end-row :end-col])})))))
+
+(defn ^:private reference->substring-edit
+  [replacement old-name db reference]
+  (let [ref-name (name (:name reference))
+        new-text (string/replace ref-name old-name replacement)]
+    (when (and (not (string/blank? old-name))
+               (not= ref-name new-text))
+      (let [name-end-col (or (:name-end-col reference) (:end-col reference))
+            name-start (- name-end-col (count ref-name))
+            ref-doc-uri (:uri reference)
+            version (get-in db [:documents ref-doc-uri :v] 0)]
+        {:range (shared/->range (assoc reference :name-col name-start))
+         :new-text new-text
+         :text-document {:version version :uri ref-doc-uri}}))))
+
+(defn ^:private existing-edit-keys
+  [edits]
+  (into #{}
+        (map (fn [{:keys [range text-document]}]
+               [(:uri text-document) range]))
+        edits))
+
+(defn ^:private existing-edit-ranges-by-uri
+  [edits]
+  (reduce (fn [acc {:keys [range text-document]}]
+            (update acc (:uri text-document) (fnil conj []) range))
+          {}
+          edits))
+
+(defn ^:private pos<=
+  [{line-a :line char-a :character} {line-b :line char-b :character}]
+  (or (< line-a line-b)
+      (and (= line-a line-b) (<= char-a char-b))))
+
+(defn ^:private range-before?
+  [range-a range-b]
+  (let [end-a (:end range-a)
+        start-b (:start range-b)]
+    (pos<= end-a start-b)))
+
+(defn ^:private range-overlaps?
+  [range-a range-b]
+  (not (or (range-before? range-a range-b)
+           (range-before? range-b range-a))))
+
+(defn ^:private reference-name
+  [reference]
+  (some-> (:name reference) name))
+
+(defn ^:private substring-reference?
+  [old-name reference]
+  (let [ref-name (reference-name reference)]
+    (and (string? old-name)
+         (not (string/blank? old-name))
+         ref-name
+         (string/includes? ref-name old-name)
+         (not= ref-name old-name))))
+
+(defn ^:private common-prefix
+  [strings]
+  (let [non-empty (remove string/blank? strings)]
+    (if (seq non-empty)
+      (reduce
+        (fn [prefix s]
+          (let [limit (min (count prefix) (count s))]
+            (loop [idx 0]
+              (if (or (= idx limit)
+                      (not= (nth prefix idx) (nth s idx)))
+                (subs prefix 0 idx)
+                (recur (inc idx))))))
+        (first non-empty)
+        (rest non-empty))
+      "")))
+
+(defn ^:private infer-old-name
+  [references definition cursor-token]
+  (let [ref-names (keep (fn [reference]
+                          (some-> (:name reference) name))
+                        references)
+        cursor-name (:name cursor-token)
+        cursor-text (:text cursor-token)
+        cursor-candidate (or cursor-name cursor-text)
+        cursor-candidate (when (and (string? cursor-candidate)
+                                    (not (string/blank? cursor-candidate))
+                                    (some #(string/includes? % cursor-candidate) ref-names))
+                           cursor-candidate)
+        prefix (common-prefix ref-names)
+        def-name (some-> definition :name name)]
+    (first (remove string/blank? [cursor-candidate prefix def-name]))))
+
+(defn ^:private substring-edit-pairs
+  [old-name replacement db references]
+  (->> references
+       (filter #(contains? #{:var-usages :symbols} (:bucket %)))
+       (filter #(substring-reference? old-name %))
+       (keep (fn [reference]
+               (when-let [edit (reference->substring-edit replacement old-name db reference)]
+                 {:reference-range (shared/->range reference)
+                  :edit edit})))
+       vec))
+
+(defn ^:private match-substring-edit-index
+  [pairs used change]
+  (first
+    (keep-indexed (fn [idx {:keys [reference-range]}]
+                    (when (and (not (contains? used idx))
+                               (range-overlaps? reference-range (:range change)))
+                      idx))
+                  pairs)))
+
+(defn ^:private apply-substring-edits
+  [changes substring-pairs]
+  (let [[updated-changes used] (reduce (fn [[acc used] change]
+                                         (if-let [idx (match-substring-edit-index substring-pairs used change)]
+                                           [(conj acc (:edit (nth substring-pairs idx)))
+                                            (conj used idx)]
+                                           [(conj acc change) used]))
+                                       [[] #{}]
+                                       changes)
+        updated-changes (vec updated-changes)
+        existing-keys (existing-edit-keys updated-changes)
+        remaining (->> (map-indexed vector substring-pairs)
+                       (remove #(contains? used (first %)))
+                       (map (comp :edit second))
+                       (remove (fn [{:keys [range text-document]}]
+                                 (contains? existing-keys [(:uri text-document) range]))))]
+    (into updated-changes remaining)))
+
+(defn ^:private cursor-token-edit
+  [cursor-token old-name replacement db uri existing-edits]
+  (when (and cursor-token
+             (string? old-name)
+             (not (string/blank? old-name))
+             (string? replacement)
+             (not= old-name replacement))
+    (let [{:keys [range]} cursor-token
+          existing-ranges-by-uri (existing-edit-ranges-by-uri existing-edits)
+          edit {:range range
+                :new-text replacement
+                :text-document {:version (get-in db [:documents uri :v] 0)
+                                :uri uri}}]
+      (when-not (some #(range-overlaps? % range) (get existing-ranges-by-uri uri))
+        edit))))
+
+(defn ^:private rename-status
+  ([db element]
+   (rename-status db element nil nil))
+  ([db element references definition]
+   (let [references (or references (q/find-references db element true))
+         definition (or definition (q/find-definition db element))
         client-capabilities (:client-capabilities db)
         source-paths (settings/get db [:source-paths])
         source-path (some-> (:uri definition)
@@ -264,7 +440,7 @@
       {:result :success
        :references references
        :definition definition
-       :source-path source-path})))
+       :source-path source-path}))))
 
 (def ^:private error-no-element
   {:error {:code :invalid-params
@@ -280,37 +456,71 @@
           result
           (shared/->range element))))))
 
-(defn rename-element [new-name db element source]
-  (let [{:keys [error] :as result} (rename-status db element)]
-    (if error
-      result
-      (let [{:keys [references definition source-path]} result
-            replacement (string/replace new-name #".*/([^/]*)$" "$1")
-            changes (rename-changes element definition references replacement new-name db)
-            doc-changes (->> changes
-                             (group-by :text-document)
-                             (remove (comp empty? val))
-                             (map (fn [[text-document edits]]
-                                    {:text-document text-document
-                                     :edits (mapv #(dissoc % :text-document) edits)})))]
-        (if (and (identical? :namespace-definitions (:bucket definition))
-                 (not (identical? :namespace-alias (:bucket element)))
-                 (not= :rename-file source))
-          (let [def-uri (:uri definition)
-                file-type (shared/uri->file-type def-uri)
-                new-uri (shared/namespace->uri replacement source-path file-type db)]
-            ;; We only add the rename file change as willRenameFiles request
-            ;; will do the other changes
-            (shared/client-changes (concat
-                                     (when (:api? db) doc-changes)
-                                     [{:kind "rename"
-                                       :old-uri def-uri
-                                       :new-uri new-uri}])
-                                   db))
-          (shared/client-changes doc-changes db))))))
+(defn rename-element
+  ([new-name db element source]
+   (rename-element new-name db element source nil))
+  ([new-name db element source cursor-token]
+   (let [{:keys [row col]} (:pos cursor-token)
+         cursor-elements (when (and cursor-token (= source :rename) row col)
+                           (q/find-all-elements-under-cursor db (:uri element) row col))
+         var-def-elements (filter #(identical? :var-definitions (:bucket %)) cursor-elements)
+         cursor-references (when (and (< 1 (count var-def-elements)) row col)
+                             (q/find-references-from-cursor db (:uri element) row col true))
+         {:keys [error] :as result} (rename-status db element cursor-references nil)]
+     (if error
+       result
+       (let [{:keys [references definition source-path]} result
+             replacement (string/replace new-name #".*/([^/]*)$" "$1")
+             old-name (infer-old-name references definition cursor-token)
+             references (if (and (string? old-name)
+                                 (not (string/blank? old-name)))
+                          (remove (fn [reference]
+                                    (and (identical? :var-definitions (:bucket reference))
+                                         (not= (reference-name reference) old-name)))
+                                  references)
+                          references)
+             changes (rename-changes element definition references replacement new-name db)
+             substring-pairs (when (and (string? old-name)
+                                        (not (string/blank? old-name)))
+                               (substring-edit-pairs old-name replacement db references))
+             changes (if (seq substring-pairs)
+                       (apply-substring-edits changes substring-pairs)
+                       changes)
+             token-edit (when (and cursor-token
+                                   (string? old-name)
+                                   (not (string/blank? old-name))
+                                   (or (= old-name (:name cursor-token))
+                                       (= old-name (:text cursor-token))))
+                          (cursor-token-edit cursor-token old-name replacement db (:uri element) changes))
+             changes (cond-> changes
+                       token-edit (conj token-edit))
+             doc-changes (->> changes
+                              (group-by :text-document)
+                              (remove (comp empty? val))
+                              (map (fn [[text-document edits]]
+                                     {:text-document text-document
+                                      :edits (mapv #(dissoc % :text-document) edits)})))]
+         (if (and (identical? :namespace-definitions (:bucket definition))
+                  (not (identical? :namespace-alias (:bucket element)))
+                  (not= :rename-file source))
+           (let [def-uri (:uri definition)
+                 file-type (shared/uri->file-type def-uri)
+                 new-uri (shared/namespace->uri replacement source-path file-type db)]
+             ;; We only add the rename file change as willRenameFiles request
+             ;; will do the other changes
+             (shared/client-changes (concat
+                                      (when (:api? db) doc-changes)
+                                      [{:kind "rename"
+                                        :old-uri def-uri
+                                        :new-uri new-uri}])
+                                    db))
+           (shared/client-changes doc-changes db)))))))
 
 (defn rename-from-position
   [uri new-name row col db]
-  (if-let [element (q/find-element-under-cursor db uri row col)]
-    (rename-element new-name db element :rename)
-    error-no-element))
+  (let [elements (q/find-all-elements-under-cursor db uri row col)
+        element (or (first (filter #(identical? :var-definitions (:bucket %)) elements))
+                    (first elements))]
+    (if element
+      (rename-element new-name db element :rename (cursor-token-at-position db uri row col))
+      error-no-element)))

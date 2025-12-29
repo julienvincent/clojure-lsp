@@ -234,8 +234,60 @@
           [start-row start-col] def-start-pos
           result (:changes (f.rename/rename-from-position h/default-uri "Bar" start-row start-col (h/db)))]
       (is (= {h/default-uri [{:new-text "Bar" :range (h/->range def-start-pos def-end-pos)}]
-              (h/file-uri "file:///b.clj") [{:new-text "Bar" :range (h/->range usage-start-pos usage-end-pos)}]}
+             (h/file-uri "file:///b.clj") [{:new-text "Bar" :range (h/->range usage-start-pos usage-end-pos)}]}
              result)))))
+
+(deftest rename-from-macro-with-multiple-var-definitions
+  (testing "rename replaces the macro call token and all derived usages"
+    (h/reset-components!)
+    (let [uri (h/file-uri "file:///a.clj")
+          [def-start def-stop] (h/load-code-and-locs
+                                 (h/code "(ns a)"
+                                         "(defthings |Example|)")
+                                 uri)
+          [def-row def-col] def-start
+          [def-end-row def-end-col] def-stop
+          _ (swap! (h/db*) update-in [:analysis uri :var-definitions]
+                   (fn [defs]
+                     (conj (vec defs)
+                           {:bucket :var-definitions
+                            :ns 'a
+                            :name 'Example1
+                            :name-row def-row
+                            :name-col def-col
+                            :name-end-row def-end-row
+                            :name-end-col def-end-col
+                            :row def-row
+                            :col def-col
+                            :end-row def-end-row
+                            :end-col def-end-col
+                            :uri uri
+                            :defined-by 'defthings}
+                           {:bucket :var-definitions
+                            :ns 'a
+                            :name 'Example2
+                            :name-row def-row
+                            :name-col def-col
+                            :name-end-row def-end-row
+                            :name-end-col def-end-col
+                            :row def-row
+                            :col def-col
+                            :end-row def-end-row
+                            :end-col def-end-col
+                            :uri uri
+                            :defined-by 'defthings})))
+          [usage1-start usage1-stop
+           usage2-start usage2-stop] (h/load-code-and-locs
+                                       (h/code "(ns b (:require [a]))"
+                                               "(a/|Example1|)"
+                                               "(a/|Example2|)")
+                                       (h/file-uri "file:///b.clj"))
+          changes (:changes (f.rename/rename-from-position uri "ExampleFoo" def-row def-col (h/db)))]
+      (is (= {uri [{:new-text "ExampleFoo" :range (h/->range def-start def-stop)}]
+              (h/file-uri "file:///b.clj")
+              [{:new-text "ExampleFoo1" :range (h/->range usage1-start usage1-stop)}
+               {:new-text "ExampleFoo2" :range (h/->range usage2-start usage2-stop)}]}
+             changes)))))
 
 (deftest rename-alias-from-usages
   (h/reset-components!)
